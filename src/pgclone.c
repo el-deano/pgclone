@@ -1156,8 +1156,75 @@ pgclone_exec_conn(PGconn *conn, const char *query)
         return false;
     }
 
-    PQclear(res);
-    return true;
+	PQclear(res);
+	return true;
+}
+
+/* ---------------------------------------------------------------
+ * Kahn topological order for n nodes.
+ *
+ * adj is an n×n row-major adjacency matrix: adj[src * n + dep] means
+ * "src must be created before dep".  On success, fills order[0..n-1]
+ * with a valid permutation and returns n.  On a cycle (or any other
+ * incomplete order), returns the number of nodes that could be
+ * ordered (< n); order[0..returned-1] are the ordered prefix.
+ *
+ * Callers should pass nodes already sorted by a stable key (e.g. name)
+ * so equal-priority nodes keep that order.
+ * --------------------------------------------------------------- */
+static int
+pgclone_kahn_order(int n, const bool *adj, int *order)
+{
+	int	   *indegree;
+	int	   *queue;
+	int		qhead;
+	int		qtail;
+	int		nordered;
+	int		i;
+	int		v;
+
+	if (n <= 0)
+		return 0;
+
+	indegree = (int *) palloc0(n * sizeof(int));
+	queue = (int *) palloc(n * sizeof(int));
+
+	for (i = 0; i < n; i++)
+	{
+		for (v = 0; v < n; v++)
+		{
+			if (adj[i * n + v])
+				indegree[v]++;
+		}
+	}
+
+	qhead = 0;
+	qtail = 0;
+	for (i = 0; i < n; i++)
+	{
+		if (indegree[i] == 0)
+			queue[qtail++] = i;
+	}
+
+	nordered = 0;
+	while (qhead < qtail)
+	{
+		int u = queue[qhead++];
+
+		order[nordered++] = u;
+		for (v = 0; v < n; v++)
+		{
+			if (!adj[u * n + v])
+				continue;
+			indegree[v]--;
+			if (indegree[v] == 0)
+				queue[qtail++] = v;
+		}
+	}
+
+	pfree(indegree);
+	pfree(queue);
+	return nordered;
 }
 
 /* ---------------------------------------------------------------
@@ -3037,9 +3104,9 @@ pgclone_schema(PG_FUNCTION_ARGS)
      * Sequences must be created before tables because a column DEFAULT
      * may use nextval('seq_name') and that reference is resolved at
      * CREATE TABLE time (against the local connection's search_path).
-     * Functions used to be cloned here too — they have been moved to
-     * Step 7 (after tables and views exist) to avoid SQL-language
-     * function bodies referencing tables that don't yet exist.
+     * Functions are cloned in Step 2c, after sequences and before
+     * tables, with check_function_bodies off so a generated column or
+     * DEFAULT can call a function in the same schema.
      */
     resetStringInfo(&buf);
     appendStringInfo(&buf,
@@ -3196,12 +3263,63 @@ pgclone_schema(PG_FUNCTION_ARGS)
 
     PQfinish(local_conn);
 
+    /* ---- Step 2c: Clone functions/procedures ----
+     *
+     * Before tables, so a generated column or column DEFAULT can call a
+     * function in this schema. check_function_bodies is off so an
+     * SQL-language body that names a table or view created later still
+     * succeeds; pg_dump does the same. pg_get_functiondef() emits a
+     * schema-qualified CREATE OR REPLACE header; the body is whatever
+     * the author wrote.
+     */
+    {
+        PGconn *src_funcs;
+        PGconn *lcl_funcs;
+        int     fcount;
+
+        /* v4.3.1: keeper liveness gate before opening another importer
+         * (issue #9). */
+        if (opts.consistent && opts.snapshot_id[0] != '\0')
+            pgclone_keeper_ping(source_conn);
+
+        src_funcs = pgclone_connect(source_conninfo);
+        lcl_funcs = pgclone_connect_local();
+
+        pgclone_setup_source_txn(src_funcs, &opts);
+
+        /* Forward references to tables and views must not fail CREATE. */
+        pgclone_exec_conn(lcl_funcs, "SET check_function_bodies = off;");
+
+        resetStringInfo(&buf);
+        appendStringInfo(&buf,
+            "SELECT pg_get_functiondef(p.oid) AS funcdef "
+            "FROM pg_catalog.pg_proc p "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = %s",
+            quote_literal_cstr(schema_name));
+
+        res = pgclone_exec(src_funcs, buf.data);
+        fcount = PQntuples(res);
+
+        for (i = 0; i < fcount; i++)
+            pgclone_exec_conn(lcl_funcs, PQgetvalue(res, i, 0));
+
+        elog(DEBUG1, "pgclone: cloned %d functions from schema %s",
+             fcount, schema_name);
+        PQclear(res);
+
+        PQfinish(lcl_funcs);
+        pgclone_setup_source_txn_done(src_funcs, &opts);
+        PQfinish(src_funcs);
+    }
+
     /* ---- Step 3: Clone tables ----
      *
      * Triggers are deferred to Step 8 by passing triggers=false through
      * to each pgclone_table() call.  This avoids two ordering hazards:
      *   1. A trigger's EXECUTE FUNCTION target may live in the same
-     *      schema and only get cloned in Step 7.
+     *      schema. Functions are cloned in Step 2c; triggers wait until
+     *      every table exists.
      *   2. A trigger may be on a partitioned parent whose partition
      *      hasn't been cloned yet.
      * The user-requested include_triggers flag is preserved in
@@ -3413,10 +3531,15 @@ pgclone_schema(PG_FUNCTION_ARGS)
         PQfinish(src_retry);
     }
 
-    /* ---- Step 5: Clone views ---- */
+    /* ---- Step 5: Clone views and materialized views ----
+     *
+     * Order by in-schema rewrite dependencies (pg_rewrite / pg_depend),
+     * then create each object once. A dependency cycle fails fast.
+     */
     {
         PGconn *src_views;
         PGconn *lcl_views;
+        const char *relkinds_sql;
 
         /* v4.3.1: keeper liveness gate before opening another importer
          * (issue #9). */
@@ -3428,71 +3551,168 @@ pgclone_schema(PG_FUNCTION_ARGS)
 
         pgclone_setup_source_txn(src_views, &opts);
 
+        relkinds_sql = opts.include_matviews ? "'v', 'm'" : "'v'";
+
         resetStringInfo(&buf);
         appendStringInfo(&buf,
-            "SELECT table_name, view_definition "
-            "FROM information_schema.views "
-            "WHERE table_schema = %s",
-            quote_literal_cstr(schema_name));
+            "SELECT c.oid::bigint, "
+            "c.relname, "
+            "pg_get_viewdef(c.oid, true), "
+            "c.relkind "
+            "FROM pg_catalog.pg_class c "
+            "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relkind IN (%s) "
+            "ORDER BY c.relname",
+            quote_literal_cstr(schema_name),
+            relkinds_sql);
 
         res = pgclone_exec(src_views, buf.data);
 
-        for (i = 0; i < PQntuples(res); i++)
         {
+            int     views_count = PQntuples(res);
+            Oid    *oids;
+            bool   *adj;
+            int    *order;
+            int     nordered;
+            int     edge_i;
+            PGresult *edge_res;
+
+            oids = (Oid *) palloc(views_count * sizeof(Oid));
+            adj = (bool *) palloc0((Size) views_count * (Size) views_count * sizeof(bool));
+            order = (int *) palloc(views_count * sizeof(int));
+
+            for (i = 0; i < views_count; i++)
+                oids[i] = (Oid) strtoul(PQgetvalue(res, i, 0), NULL, 10);
+
+            /*
+             * Edges among views/matviews in this schema: a rewrite rule
+             * for the dependent relation records a normal dependency on
+             * each referenced relation. source must be created before
+             * dependent.
+             */
             resetStringInfo(&buf);
             appendStringInfo(&buf,
-                "CREATE OR REPLACE VIEW %s.%s AS %s",
-                quote_identifier(schema_name),
-                quote_identifier(PQgetvalue(res, i, 0)),
-                PQgetvalue(res, i, 1));
-            pgclone_exec_conn(lcl_views, buf.data);
-        }
-        elog(DEBUG1, "pgclone: cloned %d views from schema %s",
-             PQntuples(res), schema_name);
-        PQclear(res);
+                "SELECT DISTINCT r.ev_class::bigint AS dependent_oid, "
+                "d.refobjid::bigint AS source_oid "
+                "FROM pg_catalog.pg_depend d "
+                "JOIN pg_catalog.pg_rewrite r ON r.oid = d.objid "
+                "JOIN pg_catalog.pg_class dep ON dep.oid = r.ev_class "
+                "JOIN pg_catalog.pg_namespace dn ON dn.oid = dep.relnamespace "
+                "JOIN pg_catalog.pg_class src ON src.oid = d.refobjid "
+                "JOIN pg_catalog.pg_namespace sn ON sn.oid = src.relnamespace "
+                "WHERE dn.nspname = %s "
+                "AND sn.nspname = %s "
+                "AND dep.relkind IN (%s) "
+                "AND src.relkind IN (%s) "
+                "AND r.ev_class <> d.refobjid "
+                "AND d.classid = 'pg_rewrite'::regclass "
+                "AND d.refclassid = 'pg_class'::regclass "
+                "AND d.deptype = 'n'",
+                quote_literal_cstr(schema_name),
+                quote_literal_cstr(schema_name),
+                relkinds_sql,
+                relkinds_sql);
 
-        /* ---- Step 6: Clone materialized views ---- */
-        if (opts.include_matviews)
-        {
-            resetStringInfo(&buf);
-            appendStringInfo(&buf,
-                "SELECT c.relname AS matview_name, "
-                "pg_get_viewdef(c.oid, true) AS matview_def "
-                "FROM pg_catalog.pg_class c "
-                "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = %s AND c.relkind = 'm' "
-                "ORDER BY c.relname",
-                quote_literal_cstr(schema_name));
+            edge_res = pgclone_exec(src_views, buf.data);
 
-            res = pgclone_exec(src_views, buf.data);
-
-            for (i = 0; i < PQntuples(res); i++)
+            for (edge_i = 0; edge_i < PQntuples(edge_res); edge_i++)
             {
-                const char *mv_name = PQgetvalue(res, i, 0);
-                const char *mv_def  = PQgetvalue(res, i, 1);
+                Oid dep_oid = (Oid) strtoul(PQgetvalue(edge_res, edge_i, 0), NULL, 10);
+                Oid src_oid = (Oid) strtoul(PQgetvalue(edge_res, edge_i, 1), NULL, 10);
+                int src_idx = -1;
+                int dep_idx = -1;
+                int j;
 
-                /* Create the materialized view — strip trailing semicolon if present */
+                for (j = 0; j < views_count; j++)
                 {
-                    char *mv_def_clean = pstrdup(mv_def);
-                    size_t mv_len = strlen(mv_def_clean);
-                    while (mv_len > 0 &&
-                           (mv_def_clean[mv_len - 1] == ';' ||
-                            mv_def_clean[mv_len - 1] == ' ' ||
-                            mv_def_clean[mv_len - 1] == '\n'))
-                        mv_def_clean[--mv_len] = '\0';
+                    if (oids[j] == src_oid)
+                        src_idx = j;
+                    if (oids[j] == dep_oid)
+                        dep_idx = j;
+                }
 
-                    resetStringInfo(&buf);
+                if (src_idx < 0 || dep_idx < 0 || src_idx == dep_idx)
+                    continue;
+                if (!adj[src_idx * views_count + dep_idx])
+                    adj[src_idx * views_count + dep_idx] = true;
+            }
+            PQclear(edge_res);
+
+            nordered = pgclone_kahn_order(views_count, adj, order);
+            if (nordered < views_count)
+            {
+                StringInfoData unresolved;
+
+                initStringInfo(&unresolved);
+                for (i = 0; i < views_count; i++)
+                {
+                    int j;
+                    bool seen = false;
+
+                    for (j = 0; j < nordered; j++)
+                    {
+                        if (order[j] == i)
+                        {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen)
+                    {
+                        if (unresolved.len > 0)
+                            appendStringInfoString(&unresolved, ", ");
+                        appendStringInfoString(&unresolved, PQgetvalue(res, i, 1));
+                    }
+                }
+
+				ereport(ERROR,
+						(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+						 errmsg("pgclone: dependency cycle among views/matviews in schema %s",
+								schema_name),
+						 errdetail("Could not order: %s", unresolved.data)));
+			}
+
+            for (i = 0; i < nordered; i++)
+            {
+                int         idx = order[i];
+                const char *v_name = PQgetvalue(res, idx, 1);
+                const char *v_def = PQgetvalue(res, idx, 2);
+                const char *v_kind = PQgetvalue(res, idx, 3);
+                char       *v_def_clean;
+                size_t      v_len;
+
+                v_def_clean = pstrdup(v_def);
+                v_len = strlen(v_def_clean);
+                while (v_len > 0 &&
+                       (v_def_clean[v_len - 1] == ';' ||
+                        v_def_clean[v_len - 1] == ' ' ||
+                        v_def_clean[v_len - 1] == '\n'))
+                    v_def_clean[--v_len] = '\0';
+
+                resetStringInfo(&buf);
+                if (v_kind[0] == 'v')
+                    appendStringInfo(&buf,
+                        "CREATE OR REPLACE VIEW %s.%s AS %s",
+                        quote_identifier(schema_name),
+                        quote_identifier(v_name),
+                        v_def_clean);
+                else
                     appendStringInfo(&buf,
                         "CREATE MATERIALIZED VIEW IF NOT EXISTS %s.%s AS %s WITH DATA",
                         quote_identifier(schema_name),
-                        quote_identifier(mv_name),
-                        mv_def_clean);
-                    pgclone_exec_conn(lcl_views, buf.data);
-                    pfree(mv_def_clean);
+                        quote_identifier(v_name),
+                        v_def_clean);
+
+                if (!pgclone_exec_conn(lcl_views, buf.data))
+                {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+                             errmsg("pgclone: failed to create %s %s.%s after dependency ordering",
+                                    v_kind[0] == 'm' ? "materialized view" : "view",
+                                    schema_name, v_name)));
                 }
 
-                /* Clone indexes on materialized view */
-                if (opts.include_indexes)
+                if (v_kind[0] == 'm' && opts.include_indexes)
                 {
                     PGresult *idx_res;
                     int       idx_i;
@@ -3505,76 +3725,34 @@ pgclone_schema(PG_FUNCTION_ARGS)
                         "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
                         "WHERE n.nspname = %s AND c.relname = %s",
                         quote_literal_cstr(schema_name),
-                        quote_literal_cstr(mv_name));
+                        quote_literal_cstr(v_name));
 
                     idx_res = pgclone_exec(src_views, buf.data);
                     for (idx_i = 0; idx_i < PQntuples(idx_res); idx_i++)
                         pgclone_exec_conn(lcl_views, PQgetvalue(idx_res, idx_i, 0));
                     PQclear(idx_res);
                 }
+                pfree(v_def_clean);
             }
 
-            elog(DEBUG1, "pgclone: cloned %d materialized views from schema %s",
-                 PQntuples(res), schema_name);
-            PQclear(res);
+            if (views_count > 0)
+                elog(DEBUG1, "pgclone: cloned %d views/matviews from schema %s",
+                     views_count, schema_name);
+
+            pfree(oids);
+            pfree(adj);
+            pfree(order);
         }
+        PQclear(res);
 
         PQfinish(lcl_views);
         pgclone_setup_source_txn_done(src_views, &opts);
         PQfinish(src_views);
     }
 
-    /* ---- Step 7: Clone functions/procedures ----
-     *
-     * Deferred until tables, views, and matviews exist so that
-     * SQL-language function bodies (which validate object references
-     * at CREATE FUNCTION time) don't fail on forward references to
-     * objects in this schema.  pg_get_functiondef() already emits the
-     * CREATE OR REPLACE FUNCTION header schema-qualified; the body is
-     * reproduced verbatim from pg_proc.prosrc, so qualification of
-     * references inside the body is whatever the original author wrote.
-     */
-    {
-        PGconn *src_funcs;
-        PGconn *lcl_funcs;
-        int     fcount;
-
-        /* v4.3.1: keeper liveness gate before opening another importer
-         * (issue #9). */
-        if (opts.consistent && opts.snapshot_id[0] != '\0')
-            pgclone_keeper_ping(source_conn);
-
-        src_funcs = pgclone_connect(source_conninfo);
-        lcl_funcs = pgclone_connect_local();
-
-        pgclone_setup_source_txn(src_funcs, &opts);
-
-        resetStringInfo(&buf);
-        appendStringInfo(&buf,
-            "SELECT pg_get_functiondef(p.oid) AS funcdef "
-            "FROM pg_catalog.pg_proc p "
-            "JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace "
-            "WHERE n.nspname = %s",
-            quote_literal_cstr(schema_name));
-
-        res = pgclone_exec(src_funcs, buf.data);
-        fcount = PQntuples(res);
-
-        for (i = 0; i < fcount; i++)
-            pgclone_exec_conn(lcl_funcs, PQgetvalue(res, i, 0));
-
-        elog(DEBUG1, "pgclone: cloned %d functions from schema %s",
-             fcount, schema_name);
-        PQclear(res);
-
-        PQfinish(lcl_funcs);
-        pgclone_setup_source_txn_done(src_funcs, &opts);
-        PQfinish(src_funcs);
-    }
-
     /* ---- Step 8: Triggers (deferred from Step 3) ----
      *
-     * Functions exist now (Step 7), so trigger DDLs that reference an
+     * Functions exist now (Step 2c), so trigger DDLs that reference an
      * EXECUTE FUNCTION target in the same schema can be replayed safely.
      * We loop over the same table_names[] gathered in Step 3, opening
      * a single source/local pair to amortize connection cost.

@@ -5,7 +5,7 @@
 
 BEGIN;
 
-SELECT plan(177);
+SELECT plan(184);
 
 -- ============================================================
 -- TEST GROUP 1: Extension loads correctly
@@ -1182,6 +1182,51 @@ SELECT is(
         AND attname = 'code'),
     's',
     'schema clone keeps the generated column generated');
+
+-- ============================================================
+-- TEST GROUP 33: schema clone order
+--
+-- Functions are created before tables (check_function_bodies off)
+-- so a generated column and a DEFAULT can call a same-schema
+-- function. Views and matviews are created once in catalog
+-- dependency order (pg_rewrite / pg_depend), so a view that
+-- names a later-named view or a matview still gets created.
+-- 7 tests below — keep in sync with plan() above.
+-- ============================================================
+
+SELECT lives_ok(
+    format('SELECT pgclone.schema(%L, %L, true)',
+        current_setting('app.source_conninfo'),
+        'fwd_dep'),
+    'schema clone with a function-backed generated column and dependent views');
+
+SELECT is(
+    (SELECT attgenerated::text FROM pg_catalog.pg_attribute
+      WHERE attrelid = 'fwd_dep.measured'::regclass
+        AND attname = 'doubled'),
+    's',
+    'generated column that calls a same-schema function stays generated');
+
+SELECT results_eq(
+    $$SELECT id, doubled, label FROM fwd_dep.measured ORDER BY id$$,
+    $$VALUES (3, 6, '6')$$,
+    'generated column and default both used the function cloned first');
+
+SELECT has_view('fwd_dep', 'a_uses_z',
+    'view that depends on a later-named view was created in dependency order');
+
+SELECT has_view('fwd_dep', 'a_uses_m',
+    'view that depends on a materialized view was created in dependency order');
+
+SELECT results_eq(
+    $$SELECT n FROM fwd_dep.a_uses_z$$,
+    $$VALUES (1)$$,
+    'dependency-ordered view returns the base view row');
+
+SELECT results_eq(
+    $$SELECT n FROM fwd_dep.a_uses_m$$,
+    $$VALUES (7)$$,
+    'dependency-ordered view returns the materialized view row');
 
 SELECT * FROM finish();
 ROLLBACK;

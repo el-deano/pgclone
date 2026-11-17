@@ -417,3 +417,30 @@ CREATE TABLE test_schema.gen_test (
 );
 
 INSERT INTO test_schema.gen_test (id) VALUES (1), (2);
+
+-- ============================================================
+-- Schema clone order (pgTAP test group 33). Functions must exist
+-- before a generated column or default can call them, and views
+-- that depend on later-named views/matviews must be ordered by
+-- catalog dependencies (not name order).
+-- ============================================================
+CREATE SCHEMA fwd_dep;
+
+CREATE FUNCTION fwd_dep.double_it(n integer) RETURNS integer
+LANGUAGE sql IMMUTABLE AS $$ SELECT n * 2 $$;
+
+CREATE TABLE fwd_dep.measured (
+    id      integer PRIMARY KEY,
+    doubled integer GENERATED ALWAYS AS (fwd_dep.double_it(id)) STORED,
+    label   text DEFAULT fwd_dep.double_it(3)::text
+);
+
+INSERT INTO fwd_dep.measured (id) VALUES (3);
+
+-- Names sort dependents ahead of their bases; clone must use
+-- pg_depend / pg_rewrite order instead of relname order.
+CREATE VIEW fwd_dep.z_base AS SELECT 1 AS n;
+CREATE VIEW fwd_dep.a_uses_z AS SELECT n FROM fwd_dep.z_base;
+
+CREATE MATERIALIZED VIEW fwd_dep.m_base AS SELECT 7 AS n;
+CREATE VIEW fwd_dep.a_uses_m AS SELECT n FROM fwd_dep.m_base;

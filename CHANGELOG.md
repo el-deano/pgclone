@@ -2,6 +2,14 @@
 
 All notable changes to pgclone are documented in this file.
 
+## [Unreleased]
+
+Fork-only follow-up. These two `pgclone.schema()` behaviors were in the rb-platform patch and were not part of upstream PR #31.
+
+### Changed
+- **Functions are cloned before tables.** `pgclone.schema()` now creates functions and procedures after sequences and before tables, and sets `check_function_bodies` off on that connection. A generated column or `DEFAULT` can call a function in the same schema. An SQL function body that names a table or view created later still loads; the body is checked when the function runs.
+- **Views and materialized views are cloned in dependency order.** In-schema edges come from `pg_rewrite` / `pg_depend` (normal dependencies from a view's rewrite rule to referenced relations). Kahn's algorithm orders them; each object is created once. A dependency cycle fails with an error naming the unresolved objects instead of retrying or warning.
+
 ## [4.8.0]
 
 This release has no SQL-level changes; after `make install`, **restart PostgreSQL**, then `ALTER EXTENSION pgclone UPDATE`.
