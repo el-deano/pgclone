@@ -175,7 +175,7 @@ A partitioned table is cloned with its structure: the parent gets `PARTITION BY`
 
 ### Generated columns
 
-`GENERATED ALWAYS AS (...) STORED` columns, and `VIRTUAL` generated columns on PostgreSQL 18, are cloned as generated columns rather than as defaults. COPY does not write them; the target computes each value from the generation expression. Omit generated columns from an explicit `"columns"` list — PostgreSQL rejects `COPY` into a generated column. A virtual generated column needs PostgreSQL 18 on the target. Generation expressions that call a function in the same schema still require that function to exist first, the same as a `DEFAULT` expression does.
+`GENERATED ALWAYS AS (...) STORED` columns, and `VIRTUAL` generated columns on PostgreSQL 18, are cloned as generated columns rather than as defaults. COPY does not write them; the target computes each value from the generation expression. Omit generated columns from an explicit `"columns"` list — PostgreSQL rejects `COPY` into a generated column. A virtual generated column needs PostgreSQL 18 on the target. `pgclone.table()` still needs a function used by a generation expression or `DEFAULT` to exist already. `pgclone.schema()` creates functions first, with `check_function_bodies` off, so those expressions can call a function in the same schema.
 
 ---
 
@@ -190,6 +190,8 @@ SELECT pgclone.schema(
     true                -- include table data
 );
 ```
+
+Functions and procedures are created before tables, with `check_function_bodies` off, so a generated column or default can call a function in the same schema and an SQL function can mention a table that is created later. Views and materialized views are ordered from catalog dependencies (`pg_rewrite` / `pg_depend`) and created once in that order, so a view may depend on another view or on a materialized view without retries. A dependency cycle fails the clone.
 
 ### Clone only functions from a schema
 
